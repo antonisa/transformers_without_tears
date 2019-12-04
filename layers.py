@@ -418,3 +418,264 @@ class Decoder(nn.Module):
                 }
 
         return ret
+
+
+
+
+class PEDecoder(nn.Module):
+    """Self-attention Decoder with two cross attentions (to be used with two encoders)"""
+    def __init__(self, args):
+        super(Decoder, self).__init__()
+        self.dropout = args.dropout
+        self.num_layers = args.num_dec_layers
+        self.pre_act = args.pre_act
+
+        # sublayers
+        self.atts = nn.ModuleList([MultiheadAttention(args) for _ in range(self.num_layers)])
+        self.cross_atts1 = nn.ModuleList([MultiheadAttention(args) for _ in range(self.num_layers)])
+        self.cross_atts2 = nn.ModuleList([MultiheadAttention(args) for _ in range(self.num_layers)])
+        self.ffs = nn.ModuleList([FeedForward(args) for _ in range(self.num_layers)])
+
+        num_scales = self.num_layers * 4 + 1 if self.pre_act else self.num_layers * 4
+        if args.scnorm:
+            self.scales = nn.ModuleList([ScaleNorm(args.embed_dim ** 0.5) for _ in range(num_scales)])
+        else:
+            self.scales = nn.ModuleList([nn.LayerNorm(args.embed_dim) for _ in range(num_scales)])
+
+    def forward(self, tgt_inputs, tgt_mask, encoder1_out, encoder1_mask, encoder2_out, encoder2_mask):
+        pre_act = self.pre_act
+        post_act = not pre_act
+
+        x = F.dropout(tgt_inputs, p=self.dropout, training=self.training)
+        for i in range(self.num_layers):
+            att = self.atts[i]
+            cross_att1 = self.cross_atts1[i]
+            cross_att2 = self.cross_atts2[i]
+            ff = self.ffs[i]
+            att_scale = self.scales[4 * i]
+            cross_att_scale1 = self.scales[4 * i + 1]
+            cross_att_scale2 = self.scales[4 * i + 2]
+            ff_scale = self.scales[4 * i + 3]
+
+            residual = x
+            x = att_scale(x) if pre_act else x
+            x, _ = att(q=x, k=x, v=x, mask=tgt_mask)
+            x = residual + F.dropout(x, p=self.dropout, training=self.training)
+            x = att_scale(x) if post_act else x
+
+            residual = x
+            x = cross_att_scale1(x) + cross_att_scale2(x) if pre_act else x
+            x, _ = cross_att1(q=x, k=encoder1_out, v=encoder1_out, mask=encoder1_mask) + cross_att2(q=x, k=encoder2_out, v=encoder2_out, mask=encoder2_mask)
+            x = residual + F.dropout(x, p=self.dropout, training=self.training)
+            x = cross_att_scale1(x) + cross_att_scale2(x) if post_act else x
+
+            residual = x
+            x = ff_scale(x) if pre_act else x
+            x = ff(x)
+            x = residual + F.dropout(x, p=self.dropout, training=self.training)
+            x = ff_scale(x) if post_act else x
+
+        x = self.scales[-1](x) if pre_act else x
+        return x
+
+    def beam_step(self, inp, cache):
+        bsz, beam_size = cache['encoder1_mask'].size()[:2]
+        cache['encoder1_mask'] = cache['encoder1_mask'].reshape(bsz * beam_size, 1, 1, -1)
+        cache['encoder2_mask'] = cache['encoder2_mask'].reshape(bsz * beam_size, 1, 1, -1)
+        for i in range(self.num_layers):
+            seq_len = cache[i]['cross_att1_k'].size(2)
+            cache[i]['cross_att1_k'] = cache[i]['cross_att1_k'].reshape(bsz * beam_size, seq_len, -1)
+            cache[i]['cross_att1_v'] = cache[i]['cross_att1_v'].reshape(bsz * beam_size, seq_len, -1)
+            cache[i]['cross_att2_k'] = cache[i]['cross_att2_k'].reshape(bsz * beam_size, seq_len, -1)
+            cache[i]['cross_att2_v'] = cache[i]['cross_att2_v'].reshape(bsz * beam_size, seq_len, -1)
+
+
+            if cache[i]['att']['k'] is not None:
+                seq_len = cache[i]['att']['k'].size(2)
+                cache[i]['att']['k'] = cache[i]['att']['k'].reshape(bsz * beam_size, seq_len, -1)
+                cache[i]['att']['v'] = cache[i]['att']['v'].reshape(bsz * beam_size, seq_len, -1)
+
+        pre_act = self.pre_act
+        post_act = not pre_act
+
+        x = inp # [bsz x beam, 1, D]
+        for i in range(self.num_layers):
+            att = self.atts[i]
+            cross_att1 = self.cross_atts1[i]
+            cross_att2 = self.cross_atts2[i]
+            ff = self.ffs[i]
+            att_scale = self.scales[4 * i]
+            cross_att_scale1 = self.scales[4 * i + 1]
+            cross_att_scale2 = self.scales[4 * i + 2]
+            ff_scale = self.scales[4 * i + 3]
+
+            residual = x
+            x = att_scale(x) if pre_act else x
+            q, k, v = att.proj_qkv(x, x, x)
+            if cache[i]['att']['k'] is not None:
+                k = torch.cat((cache[i]['att']['k'], k), 1)
+                v = torch.cat((cache[i]['att']['v'], v), 1)
+
+            cache[i]['att']['k'] = k
+            cache[i]['att']['v'] = v
+
+            x, _ = att(q=q, k=k, v=v, mask=None, do_proj_qkv=False)
+            x = residual + x
+            x = att_scale(x) if post_act else x
+
+            residual = x
+            x = cross_att_scale1(x) + cross_att_scale2(x) if pre_act else x
+            q1 = cross_att1.proj_q(x)
+            k1 = cache[i]['cross_att1_k']
+            v1 = cache[i]['cross_att1_v']
+            q2 = cross_att2.proj_q(x)
+            k2 = cache[i]['cross_att2_k']
+            v2 = cache[i]['cross_att2_v']
+            mask1 = cache['encoder1_mask']
+            mask2 = cache['encoder2_mask']
+            x, _ = cross_att1(q=q1, k=k1, v=v1, mask=mask1, do_proj_qkv=False) + cross_att2(q=q2, k=k2, v=v2, mask=mask2, do_proj_qkv=False)
+            x = residual + x
+            x = cross_att_scale1(x) + cross_att_scale2(x) if post_act else x
+
+            residual = x
+            x = ff_scale(x) if pre_act else x
+            x = ff(x)
+            x = residual + x
+            x = ff_scale(x) if post_act else x
+
+        x = self.scales[-1](x) if pre_act else x
+
+        cache['encoder1_mask'] = cache['encoder1_mask'].reshape(bsz, beam_size, 1, 1, -1)
+        cache['encoder2_mask'] = cache['encoder2_mask'].reshape(bsz, beam_size, 1, 1, -1)
+        for i in range(self.num_layers):
+            seq_len = cache[i]['cross_att1_k'].size(1)
+            cache[i]['cross_att1_k'] = cache[i]['cross_att1_k'].reshape(bsz, beam_size, seq_len, -1)
+            cache[i]['cross_att1_v'] = cache[i]['cross_att1_v'].reshape(bsz, beam_size, seq_len, -1)
+            cache[i]['cross_att2_k'] = cache[i]['cross_att2_k'].reshape(bsz, beam_size, seq_len, -1)
+            cache[i]['cross_att2_v'] = cache[i]['cross_att2_v'].reshape(bsz, beam_size, seq_len, -1)
+
+            seq_len = cache[i]['att']['k'].size(1)
+            cache[i]['att']['k'] = cache[i]['att']['k'].reshape(bsz, beam_size, seq_len, -1)
+            cache[i]['att']['v'] = cache[i]['att']['v'].reshape(bsz, beam_size, seq_len, -1)
+
+        return x
+
+    def beam_decode(self, encoder1_out, encoder1_mask, encoder2_out, encoder2_mask, get_input_fn, logprob_fn, bos_id, eos_id, max_len, beam_size=4, alpha=-1):
+        # first step, beam=1
+        batch_size = encoder_out.size(0)
+        inp = get_input_fn(torch.tensor([bos_id] * batch_size).reshape(batch_size, 1), 0) # [bsz, 1, D]
+        cache = {'encoder1_mask': encoder1_mask.unsqueeze_(1), 'encoder2_mask': encoder2_mask.unsqueeze_(1)} # [bsz, beam, 1, 1, length]
+        for i in range(self.num_layers):
+            cache[i] = {'att': {'k': None, 'v': None}}
+            cache[i]['cross_att1_k'] = self.cross_atts1[i].proj_k(encoder1_out).unsqueeze_(1)
+            cache[i]['cross_att1_v'] = self.cross_atts1[i].proj_v(encoder1_out).unsqueeze_(1)
+            cache[i]['cross_att2_k'] = self.cross_atts2[i].proj_k(encoder2_out).unsqueeze_(1)
+            cache[i]['cross_att2_v'] = self.cross_atts2[i].proj_v(encoder2_out).unsqueeze_(1)
+
+        y = self.beam_step(inp, cache).squeeze_(1) # [bsz, D]
+        probs = logprob_fn(y) # [bsz, V]
+        probs[:, eos_id] = float('-inf') # no <eos> now
+        all_probs, symbols = torch.topk(probs, beam_size, dim=-1) # ([bsz, beam], [bsz, beam])
+
+        last_probs = all_probs.reshape(batch_size, beam_size)
+        last_scores = last_probs.clone()
+        all_symbols = symbols.reshape(batch_size, beam_size, 1)
+
+        cache['encoder1_mask'] = encoder1_mask.expand(-1, beam_size, -1, -1, -1)
+        cache['encoder2_mask'] = encoder2_mask.expand(-1, beam_size, -1, -1, -1)
+        for i in range(self.num_layers):
+            cache[i]['att']['k'] = cache[i]['att']['k'].expand(-1, beam_size, -1, -1)
+            cache[i]['att']['v'] = cache[i]['att']['v'].expand(-1, beam_size, -1, -1)
+            cache[i]['cross_att1_k'] = cache[i]['cross_att1_k'].expand(-1, beam_size, -1, -1)
+            cache[i]['cross_att1_v'] = cache[i]['cross_att1_v'].expand(-1, beam_size, -1, -1)
+            cache[i]['cross_att2_k'] = cache[i]['cross_att2_k'].expand(-1, beam_size, -1, -1)
+            cache[i]['cross_att2_v'] = cache[i]['cross_att2_v'].expand(-1, beam_size, -1, -1)
+
+        num_classes = probs.size(-1)
+        not_eos_mask = (torch.arange(num_classes).reshape(1, -1) != eos_id).type(encoder_mask.type())
+        maximum_length = max_len.max().item()
+        ret = [None] * batch_size
+        batch_idxs = torch.arange(batch_size)
+        for time_step in range(1, maximum_length + 1):
+            surpass_length = (max_len < time_step) + (time_step == maximum_length)
+            finished_decoded = torch.sum(all_symbols[:, :, -1] == eos_id, -1) == beam_size
+            finished_sents = ((surpass_length + finished_decoded) >= 1).type(encoder_mask.type())
+            if finished_sents.any():
+                for j in range(finished_sents.size(0)):
+                    if finished_sents[j]:
+                        ret[batch_idxs[j]] = {
+                            'symbols': all_symbols[j].clone(),
+                            'probs': last_probs[j].clone(),
+                            'scores': last_scores[j].clone()
+                        }
+
+                all_symbols = all_symbols[~finished_sents]
+                last_probs = last_probs[~finished_sents]
+                last_scores = last_scores[~finished_sents]
+                max_len = max_len[~finished_sents]
+                batch_idxs = batch_idxs[~finished_sents]
+                cache['encoder1_mask'] = cache['encoder1_mask'][~finished_sents]
+                cache['encoder2_mask'] = cache['encoder2_mask'][~finished_sents]
+                for i in range(self.num_layers):
+                    cache[i]['att']['k'] = cache[i]['att']['k'][~finished_sents]
+                    cache[i]['att']['v'] = cache[i]['att']['v'][~finished_sents]
+                    cache[i]['cross_att1_k'] = cache[i]['cross_att1_k'][~finished_sents]
+                    cache[i]['cross_att1_v'] = cache[i]['cross_att1_v'][~finished_sents]
+                    cache[i]['cross_att2_k'] = cache[i]['cross_att2_k'][~finished_sents]
+                    cache[i]['cross_att2_v'] = cache[i]['cross_att2_v'][~finished_sents]
+
+            if finished_sents.all():
+                break
+
+            bsz = all_symbols.size(0)
+            last_symbols = all_symbols[:, :, -1]
+            inps = get_input_fn(last_symbols, time_step).reshape(bsz * beam_size, -1).unsqueeze_(1) # [bsz x beam, 1, D]
+            ys = self.beam_step(inps, cache).squeeze_(1) # [bsz x beam, D]
+            probs = logprob_fn(ys) # [bsz x beam, V]
+            last_probs = last_probs.reshape(-1, 1) # [bsz x beam, 1]
+            last_scores = last_scores.reshape(-1, 1)
+            length_penalty = 1.0 if alpha == -1 else (5.0 + time_step + 1.0) ** alpha / 6.0 ** alpha
+            finished_mask = (last_symbols.reshape(-1) == eos_id).type(encoder_mask.type())
+            beam_probs = probs.clone()
+            if finished_mask.any():
+                beam_probs[finished_mask] = last_probs[finished_mask].expand(-1, num_classes).masked_fill(not_eos_mask, float('-inf'))
+                beam_probs[~finished_mask] = last_probs[~finished_mask] + probs[~finished_mask]
+            else:
+                beam_probs = last_probs + probs
+
+            beam_scores = beam_probs.clone()
+            if finished_mask.any():
+                beam_scores[finished_mask] = last_scores[finished_mask].expand(-1, num_classes).masked_fill(not_eos_mask, float('-inf'))
+                beam_scores[~finished_mask] = beam_probs[~finished_mask] / length_penalty
+            else:
+                beam_scores = beam_probs / length_penalty
+
+            beam_probs = beam_probs.reshape(bsz, -1)
+            beam_scores = beam_scores.reshape(bsz, -1)
+            max_scores, idxs = torch.topk(beam_scores, beam_size, dim=-1) # ([bsz, beam], [bsz, beam])
+            parent_idxs = idxs // num_classes
+            symbols = (idxs - parent_idxs * num_classes).type(idxs.type()) # [bsz, beam]
+
+            last_probs = torch.gather(beam_probs, -1, idxs)
+            last_scores = max_scores
+            parent_idxs = parent_idxs + torch.arange(bsz).unsqueeze_(1).type(parent_idxs.type()) * beam_size
+            parent_idxs = parent_idxs.reshape(-1)
+            all_symbols = all_symbols.reshape(bsz * beam_size, -1)[parent_idxs].reshape(bsz, beam_size, -1)
+            all_symbols = torch.cat((all_symbols, symbols.unsqueeze_(-1)), -1)
+
+            for i in range(self.num_layers):
+                seq_len = cache[i]['att']['k'].size(2)
+                cache[i]['att']['k'] = cache[i]['att']['k'].reshape(bsz * beam_size, seq_len, -1)[parent_idxs].reshape(bsz, beam_size, seq_len, -1)
+                cache[i]['att']['v'] = cache[i]['att']['v'].reshape(bsz * beam_size, seq_len, -1)[parent_idxs].reshape(bsz, beam_size, seq_len, -1)
+
+        # Some hypotheses might haven't reached EOS yet and are cut off by length limit
+        # make sure they are returned
+        if batch_idxs.size(0) > 0:
+            for j in range(batch_idxs.size(0)):
+                ret[batch_idxs[j]] = {
+                    'symbols': all_symbols[j].clone(),
+                    'probs': last_probs[j].clone(),
+                    'scores': last_scores[j].clone()
+                }
+
+        return ret
