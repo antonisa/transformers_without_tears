@@ -111,13 +111,15 @@ class Controller(object):
 
             src_lang, tgt_lang = pair.split('2')
             test_file = join(self.args.data_dir, '{}/test.{}.bpe'.format(pair, src_lang))
-            self.translate(test_file, src_lang, tgt_lang)
+            test_guess_file = join(self.args.data_dir, '{}/test.guess.{}.bpe'.format(pair, tgt_lang))
+            self.translate(test_file, test_guess_file, src_lang, tgt_lang)
 
     def run_log(self, batch_num, epoch_num):
         start = time.time()
 
         batch_data = self.data_manager.get_batch()
         src = batch_data['src']
+        guess = batch_data['guess']
         tgt = batch_data['tgt']
         targets = batch_data['targets']
         src_lang_idx = batch_data['src_lang_idx']
@@ -129,11 +131,12 @@ class Controller(object):
         self.optimizer.zero_grad()
         # move data to GPU
         src_cuda = src.to(self.device)
+        guess_cuda = guess.to(self.device, non_blocking=True)
         tgt_cuda = tgt.to(self.device, non_blocking=True)
         targets_cuda = targets.to(self.device, non_blocking=True)
         logit_mask_cuda = logit_mask.to(self.device, non_blocking=True)
         # run
-        ret = self.model(src_cuda, tgt_cuda, targets_cuda, src_lang_idx, tgt_lang_idx, logit_mask_cuda)
+        ret = self.model(src_cuda, guess_cuda, tgt_cuda, targets_cuda, src_lang_idx, tgt_lang_idx, logit_mask_cuda)
         opt_loss = ret['opt_loss']
         # back-prob
         opt_loss.backward()
@@ -304,13 +307,14 @@ class Controller(object):
                 weight = 0.
 
                 it = self.data_manager.data[pair][ac.DEV].get_iter()
-                for src, tgt, targets in it:
+                for src, guess, tgt, targets in it:
                     src_cuda = src.to(self.device)
+                    guess_cuda = guess.to(self.device)
                     tgt_cuda = tgt.to(self.device)
                     targets_cuda = targets.to(self.device)
                     logit_mask_cuda = self.data_manager.logit_masks[tgt_lang].to(self.device)
 
-                    ret = self.model(src_cuda, tgt_cuda, targets_cuda, src_lang_idx, tgt_lang_idx, logit_mask_cuda)
+                    ret = self.model(src_cuda, guess_cuda, tgt_cuda, targets_cuda, src_lang_idx, tgt_lang_idx, logit_mask_cuda)
                     loss += ret['loss'].item()
                     nll_loss += ret['nll_loss'].item()
                     weight += ret['num_words'].item()
@@ -341,10 +345,11 @@ class Controller(object):
                 logit_mask = self.data_manager.logit_masks[tgt_lang]
                 data = self.data_manager.translate_data[pair]
                 src_batches = data['src_batches']
+                guess_batches = data['guess_batches']
                 sorted_idxs = data['sorted_idxs']
                 ref_file = data['ref_file']
 
-                all_best_trans, all_beam_trans = self._translate(src_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask)
+                all_best_trans, all_beam_trans = self._translate(src_batches, guess_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask)
 
                 all_best_trans = ''.join(all_best_trans)
                 best_trans_file = join(dump_dir, '{}_val_trans.txt.bpe'.format(pair))
@@ -403,7 +408,7 @@ class Controller(object):
 
         return best_trans, '\n'.join(beam_trans)
 
-    def _translate(self, src_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask):
+    def _translate(self, src_batches, guess_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask):
         all_best_trans = [''] * sorted_idxs.shape[0]
         all_beam_trans = [''] * sorted_idxs.shape[0]
 
@@ -411,10 +416,11 @@ class Controller(object):
         count = 0
         self.model.eval()
         with torch.no_grad():
-            for src in src_batches:
+            for src,guess in zip(src_batches, guess_batches):
                 src_cuda = src.to(self.device)
+                guess_cuda = guess.to(self.device)
                 logit_mask = logit_mask.to(self.device)
-                ret = self.model.beam_decode(src_cuda, src_lang_idx, tgt_lang_idx, logit_mask)
+                ret = self.model.beam_decode(src_cuda, guess_cuda, src_lang_idx, tgt_lang_idx, logit_mask)
                 for x in ret:
                     probs = x['probs'].cpu().detach().numpy().reshape([-1])
                     scores = x['scores'].cpu().detach().numpy().reshape([-1])
@@ -426,18 +432,18 @@ class Controller(object):
 
                     count += 1
                     if count % 100 == 0:
-                        self.logger.info('   Translaing line {}, avg {:.2f} sents/second'.format(count, count / (time.time() - start)))
+                        self.logger.info('   Translating line {}, avg {:.2f} sents/second'.format(count, count / (time.time() - start)))
 
         self.model.train()
 
         return all_best_trans, all_beam_trans
 
-    def translate(self, src_file, src_lang, tgt_lang, batch_size=4096):
-        src_batches, sorted_idxs = self.data_manager.get_translate_batches(src_file, batch_size=batch_size)
+    def translate(self, src_file, guess_file, src_lang, tgt_lang, batch_size=4096):
+        src_batches, guess_batches, sorted_idxs = self.data_manager.get_translate_batches(src_file, guess_file, batch_size=batch_size)
         src_lang_idx = self.data_manager.lang_vocab[src_lang]
         tgt_lang_idx = self.data_manager.lang_vocab[tgt_lang]
         logit_mask = self.data_manager.logit_masks[tgt_lang]
-        all_best_trans, all_beam_trans = self._translate(src_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask)
+        all_best_trans, all_beam_trans = self._translate(src_batches, guess_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask)
 
         # write to file
         all_best_trans = ''.join(all_best_trans)

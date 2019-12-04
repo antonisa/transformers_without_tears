@@ -63,7 +63,7 @@ if __name__ == '__main__':
     # log args for future reference
     logger.info(args)
 
-    model = Transformer(args)
+    model = PETransformer(args)
     # TODO: nicer formatting?
     logger.info(model)
     param_count = sum([np.prod(p.size()) for p in model.parameters()])
@@ -78,7 +78,7 @@ if __name__ == '__main__':
         controller.model.load_state_dict(torch.load(args.model_file))
         files_langs = args.files_langs
         for fl in files_langs:
-            input_file, src_lang, tgt_lang = fl.split(',')
-            controller.translate(input_file, src_lang, tgt_lang)
+            input_file, input_guess_file, src_lang, tgt_lang = fl.split(',')
+            controller.translate(input_file, input_guess_file, src_lang, tgt_lang)
     else:
         raise ValueError('Unknown mode. Only train/translate.')
